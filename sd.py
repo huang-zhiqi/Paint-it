@@ -1,8 +1,14 @@
 from transformers import CLIPTextModel, CLIPTokenizer, logging
 from diffusers import AutoencoderKL, UNet2DConditionModel, PNDMScheduler, DDIMScheduler
 from diffusers.utils.import_utils import is_xformers_available
+from huggingface_hub import hf_hub_download
 from PIL import Image
+from pathlib import Path
 import matplotlib.pyplot as plt
+import shutil
+import tempfile
+import builtins
+
 # suppress partial model loading warning
 logging.set_verbosity_error()
 
@@ -34,12 +40,97 @@ def seed_everything(seed):
     torch.cuda.manual_seed(seed)
 
 
+def load_tokenizer_same_repo(repo_id: str):
+    """
+    Keep tokenizer content from the same repo for fair reproduction.
+    """
+    try:
+        return CLIPTokenizer.from_pretrained(repo_id, subfolder="tokenizer"), None
+    except Exception as e:
+        print(f'[WARN] direct tokenizer load failed for {repo_id}/tokenizer: {e}')
+        print(f'[WARN] fallback to hf_hub_download with the same tokenizer files from {repo_id}')
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="paintit_tokenizer_"))
+
+        required_files = [
+            "vocab.json",
+            "merges.txt",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+        ]
+
+        optional_files = [
+            "tokenizer.json",
+            "added_tokens.json",
+        ]
+
+        for fname in required_files:
+            src = hf_hub_download(
+                repo_id=repo_id,
+                filename=fname,
+                subfolder="tokenizer",
+            )
+            shutil.copy2(src, tmp_dir / fname)
+
+        for fname in optional_files:
+            try:
+                src = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=fname,
+                    subfolder="tokenizer",
+                )
+                shutil.copy2(src, tmp_dir / fname)
+            except Exception:
+                pass
+
+        tok = CLIPTokenizer.from_pretrained(str(tmp_dir), local_files_only=True)
+        return tok, str(tmp_dir)
+
+
+def load_text_encoder_same_repo(repo_id: str, device):
+    """
+    Keep text_encoder content from the same repo for fair reproduction.
+    First try original path; if transformers URL assembly breaks under mirror,
+    download the exact text_encoder files from the same repo and load locally.
+    """
+    try:
+        enc = CLIPTextModel.from_pretrained(repo_id, subfolder="text_encoder").to(device)
+        return enc, None
+    except Exception as e:
+        print(f'[WARN] direct text_encoder load failed for {repo_id}/text_encoder: {e}')
+        print(f'[WARN] fallback to hf_hub_download with the same text_encoder files from {repo_id}')
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="paintit_text_encoder_"))
+
+        # Keep the same model content. Use fp32 bin for closest reproduction.
+        required_files = [
+            "config.json",
+            "pytorch_model.bin",
+        ]
+
+        for fname in required_files:
+            src = hf_hub_download(
+                repo_id=repo_id,
+                filename=fname,
+                subfolder="text_encoder",
+            )
+            shutil.copy2(src, tmp_dir / fname)
+
+        enc = CLIPTextModel.from_pretrained(str(tmp_dir), local_files_only=True).to(device)
+        return enc, str(tmp_dir)
+
+
 class StableDiffusion(nn.Module):
-    def __init__(self, device, sd_version='2.1', hf_key=None, min=0.02, max=0.98):
+    def __init__(self, device, sd_version='2.1', hf_key=None, min=0.02, max=0.98,
+                 use_fp16=True, enable_attention_slicing=True, unet_chunk_size=2):
         super().__init__()
 
         self.device = device
         self.sd_version = sd_version
+        self._tokenizer_cache_dir = None
+        self._text_encoder_cache_dir = None
+        self.use_fp16 = bool(use_fp16 and self.device.type == 'cuda')
+        self.unet_chunk_size = builtins.max(1, int(unet_chunk_size))
 
         print(f'[INFO] loading stable diffusion...')
 
@@ -47,9 +138,9 @@ class StableDiffusion(nn.Module):
             print(f'[INFO] using hugging face custom model key: {hf_key}')
             model_key = hf_key
         elif self.sd_version == '2.1':
-            model_key = "stabilityai/stable-diffusion-2-1-base"
+            model_key = "Manojb/stable-diffusion-2-1-base"
         elif self.sd_version == '2.0':
-            model_key = "stabilityai/stable-diffusion-2-base"
+            model_key = "Manojb/stable-diffusion-2-base"
         elif self.sd_version == '1.5':
             model_key = "runwayml/stable-diffusion-v1-5"
         else:
@@ -57,12 +148,21 @@ class StableDiffusion(nn.Module):
 
         # Create model
         self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae").to(self.device)
-        self.tokenizer = CLIPTokenizer.from_pretrained(model_key, subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained(model_key, subfolder="text_encoder").to(self.device)
-        self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet").to(self.device)
+        self.tokenizer, self._tokenizer_cache_dir = load_tokenizer_same_repo(model_key)
+        self.text_encoder, self._text_encoder_cache_dir = load_text_encoder_same_repo(model_key, self.device)
+        unet_dtype = torch.float16 if self.use_fp16 else torch.float32
+        self.unet = UNet2DConditionModel.from_pretrained(
+            model_key, subfolder="unet", torch_dtype=unet_dtype
+        ).to(self.device)
+
+        if enable_attention_slicing and hasattr(self.unet, 'set_attention_slice'):
+            self.unet.set_attention_slice('auto')
 
         if is_xformers_available():
-            self.unet.enable_xformers_memory_efficient_attention()
+            try:
+                self.unet.enable_xformers_memory_efficient_attention()
+            except Exception as e:
+                print(f'[WARN] xformers memory efficient attention unavailable: {e}')
 
         self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler")
         # self.ts_sampler = TimestepSampler(self.scheduler, device=device)
@@ -74,6 +174,58 @@ class StableDiffusion(nn.Module):
         self.alphas = self.scheduler.alphas_cumprod.to(self.device)  # for convenience
 
         print(f'[INFO] loaded stable diffusion!')
+
+
+    def _run_unet(self, latents, timesteps, text_embeddings):
+        unet_dtype = next(self.unet.parameters()).dtype
+        latents = latents.to(device=self.device, dtype=unet_dtype)
+        text_embeddings = text_embeddings.to(device=self.device, dtype=unet_dtype)
+        if isinstance(timesteps, torch.Tensor):
+            timesteps = timesteps.to(self.device)
+
+        if self.device.type == 'cuda' and unet_dtype in (torch.float16, torch.bfloat16):
+            with torch.autocast(device_type='cuda', dtype=unet_dtype):
+                noise_pred = self.unet(latents, timesteps, encoder_hidden_states=text_embeddings).sample
+        else:
+            noise_pred = self.unet(latents, timesteps, encoder_hidden_states=text_embeddings).sample
+        return noise_pred
+
+
+    def _predict_noise_chunked(self, latents_noisy, timesteps, text_embeddings):
+        # text_embeddings must be [2B, S, C], where first B is uncond and next B is cond.
+        B = latents_noisy.shape[0]
+        if text_embeddings.shape[0] != 2 * B:
+            raise ValueError(f'Expected text embeddings shape[0] == 2*B ({2 * B}), got {text_embeddings.shape[0]}')
+
+        chunk_size = min(self.unet_chunk_size, B)
+        while True:
+            try:
+                noise_pred_chunks = []
+                for start in range(0, B, chunk_size):
+                    end = min(start + chunk_size, B)
+
+                    latents_chunk = latents_noisy[start:end]
+                    t_chunk = timesteps[start:end]
+                    emb_chunk = torch.cat([
+                        text_embeddings[start:end],
+                        text_embeddings[B + start:B + end]
+                    ], dim=0)
+
+                    latent_model_input = torch.cat([latents_chunk, latents_chunk], dim=0)
+                    tt = torch.cat([t_chunk, t_chunk], dim=0)
+                    noise_pred_chunk = self._run_unet(latent_model_input, tt, emb_chunk)
+                    noise_pred_chunks.append(noise_pred_chunk)
+
+                return torch.cat(noise_pred_chunks, dim=0)
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower() and chunk_size > 1:
+                    next_chunk = max(1, chunk_size // 2)
+                    print(f'[WARN] CUDA OOM in UNet chunk_size={chunk_size}, retrying with chunk_size={next_chunk}')
+                    chunk_size = next_chunk
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                raise
 
 
     def get_text_embeds(self, prompt, negative_prompt=[''], batch=1):
@@ -112,7 +264,7 @@ class StableDiffusion(nn.Module):
             # directly downsample input as latent
             latents = F.interpolate(pred_rgb, (64, 64), mode='bilinear', align_corners=False) * 2 - 1
         else:
-            if pred_rgb.shape[-1] != 512:
+            if pred_rgb.shape[-2:] != (512, 512):
                 # interp to 512x512 to be fed into vae.
                 pred_rgb_512 = F.interpolate(pred_rgb, (512, 512), mode='bilinear', align_corners=False)
             else:
@@ -128,10 +280,7 @@ class StableDiffusion(nn.Module):
             # add noise
             noise = torch.randn_like(latents)
             latents_noisy = self.scheduler.add_noise(latents, noise, t)
-            # pred noise
-            latent_model_input = torch.cat([latents_noisy] * 2)
-            tt = torch.cat([t] * 2)
-            noise_pred = self.unet(latent_model_input, tt, encoder_hidden_states=text_embeddings).sample
+            noise_pred = self._predict_noise_chunked(latents_noisy, t, text_embeddings).to(dtype=latents.dtype)
 
         # perform guidance (high scale from paper!)
         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -168,7 +317,7 @@ class StableDiffusion(nn.Module):
         for i, t in enumerate(self.scheduler.timesteps[init_step:]):
             latent_model_input = torch.cat([latents] * 2)
 
-            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+            noise_pred = self._run_unet(latent_model_input, t, text_embeddings).to(dtype=latents.dtype)
 
             noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
@@ -187,21 +336,20 @@ class StableDiffusion(nn.Module):
 
         self.scheduler.set_timesteps(num_inference_steps)
 
-        with torch.autocast('cuda'):
-            for i, t in enumerate(self.scheduler.timesteps):
-                # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
-                latent_model_input = torch.cat([latents] * 2)
+        for i, t in enumerate(self.scheduler.timesteps):
+            # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
+            latent_model_input = torch.cat([latents] * 2)
 
-                # predict the noise residual
-                with torch.no_grad():
-                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)['sample']
+            # predict the noise residual
+            with torch.no_grad():
+                noise_pred = self._run_unet(latent_model_input, t, text_embeddings).to(dtype=latents.dtype)
 
-                # perform guidance
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_text + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            # perform guidance
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_text + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents)['prev_sample']
+            # compute the previous noisy sample x_t -> x_t-1
+            latents = self.scheduler.step(noise_pred, t, latents)['prev_sample']
 
         return latents
 
@@ -280,6 +428,3 @@ if __name__ == '__main__':
     # visualize image
     plt.imshow(imgs[0])
     plt.show()
-
-
-

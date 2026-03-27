@@ -57,6 +57,7 @@ def parse_args():
     parser.add_argument('--log_freq', type=int, default=100)
     parser.add_argument('--gd_scale', type=int, default=100)
     parser.add_argument('--uv_res', type=int, default=512)
+    parser.add_argument('--final_render_chunk', type=int, default=8)
 
     args = parser.parse_args()
     args.kd_min = [0.0, 0.0, 0.0, 0.0]  # Limits for kd
@@ -311,6 +312,7 @@ def main(args, guidance):
         final_ks = final_tex[..., -6:-3]
         final_n = F.normalize((final_tex[..., -3:] * 2.0 - 1.0) + nrm_t, dim=-1)
         circle_n_view = 120
+        final_render_chunk = max(1, args.final_render_chunk)
         final_cam = sample_circle_view(n_view=circle_n_view, cam_radius=2.75, elev=0.0)
 
         final_material = Material({
@@ -327,19 +329,23 @@ def main(args, guidance):
         write_obj(output_dir, vis_mesh)
 
         final_lgt = lgt
-        final_buffers = render_mesh(glctx, vis_mesh, final_cam['mvp'], final_cam['campos'], final_lgt,
-                                    final_cam['resolution'], spp=final_cam['spp'], msaa=True, background=None, bsdf='pbr')
-
-        final_body_rgb = final_buffers['shaded'][..., 0:3].permute(0, 3, 1, 2).contiguous()
-        final_body_ws = final_buffers['shaded'][..., 3].unsqueeze(1)  # [B, 1, H, W]
-        vis_mesh_img = final_body_rgb * final_body_ws + (1 - final_body_ws) * 1  # white bg, float32, [B, 3, H, W]
-        #
-        # save final front body image
         os.makedirs(os.path.join(output_dir, 'view'), exist_ok=True)
-        for idx in range(circle_n_view):
-            if idx == 0:
-                torchvision.utils.save_image(vis_mesh_img[idx], os.path.join(output_dir, f"final_body.png"))
-            torchvision.utils.save_image(vis_mesh_img[idx], os.path.join(output_dir, 'view', f'{idx:04}.png'))
+        for start_idx in range(0, circle_n_view, final_render_chunk):
+            end_idx = min(start_idx + final_render_chunk, circle_n_view)
+            final_buffers = render_mesh(
+                glctx, vis_mesh, final_cam['mvp'][start_idx:end_idx], final_cam['campos'][start_idx:end_idx], final_lgt,
+                final_cam['resolution'], spp=final_cam['spp'], msaa=True, background=None, bsdf='pbr'
+            )
+
+            final_body_rgb = final_buffers['shaded'][..., 0:3].permute(0, 3, 1, 2).contiguous()
+            final_body_ws = final_buffers['shaded'][..., 3].unsqueeze(1)  # [B, 1, H, W]
+            vis_mesh_img = final_body_rgb * final_body_ws + (1 - final_body_ws) * 1  # white bg, float32, [B, 3, H, W]
+
+            for local_idx in range(end_idx - start_idx):
+                global_idx = start_idx + local_idx
+                if global_idx == 0:
+                    torchvision.utils.save_image(vis_mesh_img[local_idx], os.path.join(output_dir, "final_body.png"))
+                torchvision.utils.save_image(vis_mesh_img[local_idx], os.path.join(output_dir, 'view', f'{global_idx:04}.png'))
 
 
 if __name__ == '__main__':
@@ -360,5 +366,4 @@ if __name__ == '__main__':
         args.obj_id = obj_id
         args.identity = caption
         main(args, guidance)
-
 
