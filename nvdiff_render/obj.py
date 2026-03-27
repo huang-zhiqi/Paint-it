@@ -131,7 +131,8 @@ def write_obj(folder, mesh, save_material=True):
     obj_file = os.path.join(folder, 'mesh.obj')
     print("Writing mesh: ", obj_file)
     with open(obj_file, "w") as f:
-        f.write("mtllib mesh.mtl\n")
+        if save_material:
+            f.write("mtllib mesh.mtl\n")
         f.write("g default\n")
 
         v_pos = mesh.v_pos.detach().cpu().numpy() if mesh.v_pos is not None else None
